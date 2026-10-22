@@ -17,6 +17,18 @@ that later modules cannot quietly reuse a prefix:
 ``F4xx``
     Interval honesty — every reason a reported interval is narrower than the
     truth, measured where it can be measured.
+``F5xx``
+    Saturation evidence — the limit and its provenance, the utilization
+    distribution, the resolution a percentile claim needs, sustained time above
+    a threshold, and the headroom conversion.
+``F6xx``
+    Queueing applicability — every measured departure from the assumptions a
+    closed-form ceiling rests on. These all fail toward optimism, so a ceiling
+    carrying an F6xx finding is an upper bound on the safe operating point.
+
+The queueing module holds no finding codes of its own: it is pure arithmetic on
+a stated operating point and raises rather than reports, leaving every judgement
+about whether its assumptions hold to the saturation module that measures them.
 """
 
-__all__ = ["forecast", "seasonality"]
+__all__ = ["forecast", "queueing", "saturation", "seasonality"]
