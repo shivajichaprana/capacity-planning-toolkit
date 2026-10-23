@@ -26,4 +26,4 @@ data/
 reports/*.md
 reports/*.html
 reports/*.json
-!reports/.gitkeep
+reports/*.csv

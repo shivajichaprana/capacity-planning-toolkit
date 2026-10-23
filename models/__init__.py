@@ -26,6 +26,12 @@ that later modules cannot quietly reuse a prefix:
     closed-form ceiling rests on. These all fail toward optimism, so a ceiling
     carrying an F6xx finding is an upper bound on the safe operating point.
 
+``F7xx`` and ``F8xx``
+    Reserved by :mod:`recommend` for sizing decisions and for the
+    applicability of a simulated intervention. Nothing in this package emits
+    them; they are named here so that every reservation is visible from one
+    place and a later model cannot take a prefix that is already in use.
+
 The queueing module holds no finding codes of its own: it is pure arithmetic on
 a stated operating point and raises rather than reports, leaving every judgement
 about whether its assumptions hold to the saturation module that measures them.
