@@ -144,6 +144,11 @@ NON_STATIONARY_TREND: Final[float] = 0.25
 #: the gap is plausibly measurement noise and window misalignment.
 LITTLE_LAW_TOLERANCE: Final[float] = 0.1
 
+#: Spread, as a fraction of the series' own level, below which a series is
+#: constant as far as any correlation is concerned. What remains below this is
+#: floating-point representation error rather than variation in the workload.
+NEGLIGIBLE_RELATIVE_SPREAD: Final[float] = 1e-12
+
 #: Every finding this module can emit, grouped by what it is about, so a report
 #: can resolve a code without reading the source and a reviewer can see the
 #: whole set of objections at once.
@@ -271,13 +276,24 @@ def lag1_autocorrelation(values: Sequence[float]) -> float | None:
     Undefined for a constant series, where the denominator vanishes. A constant
     series is not evidence of independence, so ``None`` is returned rather than
     zero.
+
+    "Constant" has to mean constant *within rounding* rather than bit-identical.
+    A series of equal measurements that are not exactly representable -- any
+    reading of 80 against a limit of 100, for one -- leaves a spread of a few
+    parts in ten quadrillion, and a correlation computed from that spread is a
+    correlation of representation error: it comes back near 1.0 and reports a
+    flat resource as one whose load arrives in clusters. So the spread is
+    compared against the level it sits on before it is believed.
     """
     if len(values) < 3:
         return None
     mean = sum(values) / len(values)
     centred = [value - mean for value in values]
-    denominator = sum(value * value for value in centred)
+    denominator = math.fsum(value * value for value in centred)
     if denominator <= 0.0:
+        return None
+    root_mean_square = math.sqrt(denominator / len(values))
+    if root_mean_square <= NEGLIGIBLE_RELATIVE_SPREAD * max(abs(mean), 1.0):
         return None
     numerator = sum(
         centred[index] * centred[index + 1] for index in range(len(centred) - 1)
@@ -936,6 +952,23 @@ def analyse_saturation(
         )
     if service_time is not None and service_time <= 0.0:
         raise SaturationError(f"service time must be positive, got {service_time}")
+    if (
+        servers > 1
+        and service_cv_squared is not None
+        and abs(service_cv_squared - 1.0) > 1e-9
+    ):
+        # No exact several-server result exists for general service times, and
+        # the queueing layer refuses the combination rather than applying the
+        # single-server variability factor to a several-server formula. Caught
+        # here, with the other argument checks, because the alternative is a
+        # QueueingError raised from the middle of an analysis that has already
+        # recorded findings about a window it is then going to abandon.
+        raise SaturationError(
+            "a service-time variability of "
+            f"{service_cv_squared:.6g} cannot be modelled across {servers} servers: "
+            "pass servers=1 to use the general-service result, or omit the "
+            "measured variability to assume exponential service"
+        )
 
     findings: list[Finding] = []
     if not limit.is_a_real_limit:
