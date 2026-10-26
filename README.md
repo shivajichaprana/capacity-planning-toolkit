@@ -14,6 +14,18 @@ Nothing here guesses at your infrastructure. Every input is a metric you already
 emit, every assumption is written down in the model that uses it, and every
 recommendation carries the numbers it was derived from.
 
+## Documentation
+
+| Read this | For |
+|---|---|
+| This file | What the commands are, how to run them, and how to read a review |
+| [docs/capacity-model.md](docs/capacity-model.md) | Why each number is computed the way it is, and what the obvious alternative gets wrong — with a reproducible worked example |
+| [docs/assumptions.md](docs/assumptions.md) | Every assumption, where it is declared, what it defaults to, which direction it fails in, and how to check it |
+| `make help` | Every target, with the variables the analysis targets read |
+
+If you are evaluating a single review someone handed you, start with
+[how to audit a review](docs/assumptions.md#how-to-audit-a-review).
+
 ## What it does
 
 | Capability | Where |
@@ -23,19 +35,22 @@ recommendation carries the numbers it was derived from.
 | Persist and query observation history locally, de-duplicated and typed | `ingest/store.py` |
 | Seasonal shape estimation, with the mode chosen rather than assumed | `models/seasonality.py` |
 | Demand forecasting with intervals that widen with the horizon | `models/forecast.py` |
-| Utilisation and queueing-theory saturation modelling | `models/` |
-| Headroom recommendations and what-if simulation | `recommend/` |
-| Rendered capacity reviews | `reports/` |
+| Closed-form queueing arithmetic: ceilings, elasticity, server sizing | `models/queueing.py` |
+| Utilisation distribution, limit provenance, and the headroom conversion | `models/saturation.py` |
+| Run-out dates, decide-by dates and fleet sizing | `recommend/headroom.py` |
+| What-if comparison of interventions against doing nothing | `recommend/whatif.py` |
+| Rendered capacity reviews, in Markdown and JSON | `reports/review.py` |
 
 ## Repository layout
 
 ```
 ingest/      metric and cost collection, plus the local observation store
-models/      forecasting and saturation models
-recommend/   headroom arithmetic and what-if scenarios
-reports/     generated capacity reviews
-tests/       unit tests for the models and the ingestion layer
-docs/        capacity model, stated assumptions, review runbook
+models/      seasonality, forecasting, queueing arithmetic, saturation analysis
+recommend/   headroom arithmetic, fleet sizing, and what-if scenarios
+reports/     the review generator; generated reviews are written here and ignored
+tests/       checks for the models, the finding vocabulary, and the build
+docs/        the capacity model and the stated assumptions
+Makefile     every gate the pipeline runs, plus the analysis chain
 ```
 
 ## Design rules
@@ -59,14 +74,21 @@ reason the output is trustworthy rather than merely plausible.
    history, or a gap wider than the sampling period produces an explicit
    insufficient-data result. Silence about data quality is how capacity plans
    go wrong.
-5. **Local by default.** The store is a plain file. Nothing is written back to
+5. **A multiplier is reported with its basis.** "1.2x of headroom" means
+   nothing until you know what it is 1.2x *of*. Every multiplier here is
+   relative to the operating point, that basis is derived from the analysis
+   rather than supplied beside it, and a basis that disagrees is refused rather
+   than used. On a series that peaks at twice its mean, getting this wrong
+   doubles every projected multiplier and nothing in the output looks odd.
+6. **Local by default.** The store is a plain file. Nothing is written back to
    the account being measured, and read-only credentials are sufficient.
 
 ## Getting started
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'
+make install          # or: pip install -e '.[dev]'
+make check            # every gate the pipeline runs
 ```
 
 Collection needs read-only access to CloudWatch and Cost Explorer. Credentials
@@ -96,6 +118,51 @@ python -m ingest.cost \
 
 Both commands are idempotent: re-running over an overlapping window updates the
 observations it already holds rather than duplicating them.
+
+## Make targets
+
+The gate targets run the same command strings the pipeline runs, character for
+character, so a clean `make check` means what a green run means.
+`tests/test_makefile.py` compares the two files in both directions and fails
+when they drift — including when a gate is added to the pipeline with no target
+here.
+
+| Target | Does |
+|---|---|
+| `make help` | List every target and the variables the analysis targets read |
+| `make install` | Install the project and its check dependencies into the active environment |
+| `make check` | Run every gate: tests, typing, lint, compile, the import boundary |
+| `make test` | The model suite |
+| `make typing` | `mypy` over every declared package, under the strict settings |
+| `make lint` | The style contract declared in `setup.cfg` |
+| `make compile` | Confirm every committed module compiles |
+| `make analysis-imports` | Confirm the analysis layer imports with no cloud SDK present |
+| `make ingest-metrics` | Collect a utilisation or throughput series into the store |
+| `make ingest-cost` | Collect amortised spend and usage quantities into the store |
+| `make forecast` | Project the series, with an interval that widens with the horizon |
+| `make saturation` | The operating point, the ceiling, and the usable headroom |
+| `make recommend` | Fleet size, run-out date and decide-by date |
+| `make review` | The whole review: decision, evidence, options, findings |
+| `make clean` | Remove tooling caches; never the store or generated reviews |
+
+The analysis targets read the variables declared at the top of the `Makefile`
+and are meant to be overridden on the command line, which is how the series,
+the limit and the fleet stay consistent between the forecast you looked at and
+the recommendation you acted on:
+
+```bash
+make review \
+  NAMESPACE=AWS/ECS METRIC=CPUUtilization \
+  DIMENSIONS='--dimension ClusterName=production --dimension ServiceName=checkout' \
+  LIMIT=100 LIMIT_UNIT=Percent LIMIT_PROVENANCE=hard \
+  SERVICE_TIME=0.08 RESPONSE_BUDGET=0.25 \
+  UNITS=12 UNIT_NAME=task POOLING=shared UNIT_MONTHLY_COST=42 \
+  LEAD_TIME_HOURS=48 HORIZON=336 TIMEZONE=Europe/Amsterdam
+```
+
+`make analysis-imports` installs nothing on purpose: the gate is that the
+analysis layer needs only the standard library, and a target that installed the
+SDK first would prove the opposite of what it claims.
 
 ## Forecasting demand
 
@@ -217,6 +284,88 @@ Every result carries its findings. `error` means no forecast was produced.
 | F407 | note | Degrees of freedom charged for the profile, with the factor a naive count would miss |
 | F408 | note | Measured coverage on held-back history, at or above the nominal level |
 
+The table above is the forecasting vocabulary, and it is tabulated here because
+nothing else describes it. The other four ranges are registered in code and
+rendered into every review beside the finding itself, so a reader never has to
+resolve one against a document:
+
+| Range | Concern | Where it is described |
+|---|---|---|
+| `F1xx` | Seasonal structure — whether a cycle is representable, estimable and real | the table above |
+| `F2xx` | Input adequacy — history length, coverage, grid regularity | the table above |
+| `F3xx` | Model selection — which candidate won and how weak the comparison was | the table above |
+| `F4xx` | Interval honesty — every reason a reported interval is narrower than the truth | the table above |
+| `F5xx` | Saturation evidence — the limit, the percentiles, the dilution, the exceedance runs | `models.saturation.FINDING_CODES`, rendered with each finding |
+| `F6xx` | Queueing applicability — every measured departure from the assumptions the ceiling rests on | `models.saturation.FINDING_CODES`, rendered with each finding |
+| `F7xx` | Sizing and timing — provenance, run-out, decide-by, quantisation, pooling | `recommend.headroom.FINDING_CODES`, rendered with each finding |
+| `F8xx` | Scenario applicability — what each intervention holds fixed and over-promises | `recommend.whatif.FINDING_CODES`, rendered with each finding |
+
+The prefixes are reserved per concern so that a later module cannot take a range
+already in use, and `tests/test_finding_codes.py` enforces the reservations,
+the registries, this table and the renderer's remedy map against each other in
+both directions.
+
+## Reading a review
+
+`reports/review.py` renders the whole analysis — decision, evidence, options and
+findings — as Markdown and JSON side by side. The renderer computes nothing:
+every number in it is a field of a result object, formatted. So if a figure in a
+review is wrong, either an input was wrong or a model is wrong; the report
+cannot have introduced it.
+
+```bash
+make review UNITS=12 LIMIT=100 LIMIT_PROVENANCE=hard \
+  NAMESPACE=AWS/ECS METRIC=CPUUtilization REVIEW_OUT=reports
+```
+
+The sections, and what each is for:
+
+| Section | What to take from it |
+|---|---|
+| **Decision** | The action, the fleet size, the run-out date and the decide-by date. The least informative section, and the one most readers stop at |
+| **Evidence — the limit** | The denominator of every utilisation figure, and where it came from. `observed` provenance means there is no limit here, only a lower bound on one |
+| **Evidence — the operating point** | The utilisation distribution, the percentile planned to, and whether the sample can resolve it |
+| **Evidence — time above the threshold** | Sustained runs, not just a count of samples. One long run and many short ones are different problems |
+| **Evidence — headroom** | The ceiling, the absorbable demand, and the linear reading beside it |
+| **Evidence — do the queueing assumptions hold** | Measured burstiness, clustering, trend and variability. A "no" here makes the ceiling optimistic and the fleet size a lower bound |
+| **Evidence — the forecast** | Method, interval basis, measured coverage on held-back history, and every candidate's score |
+| **Options** | Alternatives against doing nothing, each with what it holds fixed. They do not add |
+| **Findings** | Grouped by severity, errors first, each with the remedy where one exists |
+
+### Audit it in this order
+
+Each step makes the next one meaningful, and the headline is last on purpose:
+
+1. **The limit's provenance.** `observed` invalidates everything downstream as a
+   bound rather than a figure.
+2. **The resolvable percentile against the requested one.** If the window cannot
+   resolve the operating percentile, the operating point is the largest few
+   samples.
+3. **Stationarity.** `F603` means the window has no single operating point.
+   Shorten it and re-run before reading anything else.
+4. **Measured interval coverage against the nominal level.** `F401` means the
+   band does not do what it claims on this series' own recent history.
+5. **Whether the decision is interval-driven.** `F711` means more history may be
+   cheaper than more capacity.
+6. **The decide-by date against today.** `F712` is the one error about the
+   calendar rather than the data, and re-running does not clear it.
+7. **Then the headline.**
+
+### Exit status
+
+Every entry point uses the same three-value vocabulary, so a pipeline step can
+branch on it:
+
+| Status | Means | Typical cause |
+|---|---|---|
+| `0` | A result was produced | — |
+| `1` | A refusal, with findings on stdout explaining it | Too little history, a coverage gap, a percentile the sample cannot resolve, no ceiling to plan against |
+| `2` | The request could not be run at all | A series not in the store, an unreadable store, a contradictory argument |
+
+A refusal is a result, not a failure: `1` means the toolkit declined to produce
+a number nobody should rely on, and said why. Treat `1` as "read the findings"
+and `2` as "fix the command".
+
 ## Configuration
 
 | Variable | Default | Purpose |
@@ -229,8 +378,9 @@ Every result carries its findings. `error` means no forecast was produced.
 
 ## Contributing
 
-Open a Discussion in the repo or comment on the PR. Report a security concern
-through a private advisory:
+Run `make check` before opening a pull request; it is every gate the pipeline
+runs. Open a Discussion in the repo or comment on the PR. Report a security
+concern through a private advisory:
 <https://github.com/shivajichaprana/capacity-planning-toolkit/security/advisories/new>
 
 ## License

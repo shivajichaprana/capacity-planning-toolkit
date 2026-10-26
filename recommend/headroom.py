@@ -132,7 +132,7 @@ STEEP_REGION_UTILIZATION: Final[float] = 0.85
 FINDING_CODES: Final[dict[str, str]] = {
     "F700": "the saturation analysis produced no ceiling to plan against",
     "F701": "the forecast produced no projection to plan with",
-    "F702": "peak-to-mean held fixed while the level moves",
+    "F702": "the operating point is compared against a projected peak",
     "F703": "the ceiling rests on an observed maximum, not a limit",
     "F704": "the binding limit is a quota, so the fix is a request, not a deploy",
     "F705": "the operating point already sits at or above the ceiling",
@@ -209,23 +209,41 @@ class Fleet:
         return f"{self.units} {plural} ({self.pooling})"
 
 
-def demand_reference(series: MetricSeries) -> float:
-    """The demand level the saturation operating point was measured against.
+def demand_reference(saturation: SaturationResult) -> float:
+    """The demand level the saturation operating point sits at, in metric units.
 
-    The mean of the analysed window. A forecast value divided by this is a
-    demand multiplier on the same basis the saturation ceiling uses, which is
-    the only form in which the two can be compared.
+    The absorbable demand multiplier the saturation module reports is a
+    multiplier on its **operating point** -- the planning percentile of the
+    observed utilization -- and not on the window mean. So the only level a
+    forecast value may be divided by, if the quotient is to be comparable
+    against that multiplier, is the level at that same operating point.
+
+    The two differ by exactly the peak-to-mean ratio, which is the whole point
+    of measuring a peak: dividing by the window mean on a series that peaks at
+    twice its mean inflates every projected multiplier twofold, so a fleet with
+    a fifth of its growth left reports as already out of headroom at the first
+    daily peak. The mistake is invisible in the output -- a multiplier is a
+    bare number and carries no basis with it -- which is why the basis is
+    derived here from the analysis itself rather than passed in alongside it.
+
+    Utilization is the metric value over the limit, so the level at the
+    operating point is the planning percentile multiplied back out by the limit
+    that normalised it.
     """
-    values = series.values
-    if not values:
-        raise RecommendationError("cannot take a demand reference from an empty series")
-    total = math.fsum(values)
-    if total <= 0.0:
+    profile = saturation.profile
+    limit = saturation.limit
+    if profile is None or limit is None:
         raise RecommendationError(
-            "the analysed window has a non-positive mean, so demand cannot be "
-            "expressed as a multiplier of it"
+            "the saturation analysis produced no operating point, so there is no "
+            "demand level to express a forecast as a multiple of"
         )
-    return total / len(values)
+    level = profile.planning_value * limit.value
+    if level <= 0.0:
+        raise RecommendationError(
+            f"the operating point is at a non-positive level of {level:.6g}, so "
+            "demand cannot be expressed as a multiple of it"
+        )
+    return level
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +253,17 @@ def demand_reference(series: MetricSeries) -> float:
 
 @dataclass(frozen=True, slots=True)
 class RunOut:
-    """When demand reaches the ceiling, read two ways."""
+    """When demand reaches the ceiling, read two ways.
+
+    Two multipliers are reported for each track, and the distinction matters
+    more than it looks. The value *at the horizon* is whatever phase the last
+    projected period happens to fall on: on a series with a weekly cycle, a
+    horizon ending on a Sunday night reads a third of what the same horizon
+    plus eight periods reads on a Monday afternoon. The *peak* over the horizon
+    is the figure a plan has to cover, and it is the one sizing uses -- it is
+    also the track the crossing is read off, so a crossing inside the horizon
+    and a peak above the ceiling are the same statement.
+    """
 
     ceiling_multiplier: float
     reference_level: float
@@ -244,6 +272,8 @@ class RunOut:
     central_crossing: datetime | None
     upper_multiplier_at_horizon: float
     central_multiplier_at_horizon: float
+    upper_multiplier_peak: float
+    central_multiplier_peak: float
     already_past: bool
 
     @property
@@ -371,6 +401,8 @@ class Recommendation:
                     ),
                     "upper_multiplier_at_horizon": self.run_out.upper_multiplier_at_horizon,
                     "central_multiplier_at_horizon": self.run_out.central_multiplier_at_horizon,
+                    "upper_multiplier_peak": self.run_out.upper_multiplier_peak,
+                    "central_multiplier_peak": self.run_out.central_multiplier_peak,
                     "already_past": self.run_out.already_past,
                 }
             ),
@@ -465,6 +497,10 @@ def _run_out(
         central_crossing=_crossing(points, reference_level, ceiling, upper=False),
         upper_multiplier_at_horizon=last.upper_one_sided / reference_level,
         central_multiplier_at_horizon=last.value / reference_level,
+        upper_multiplier_peak=max(
+            point.upper_one_sided for point in points
+        ) / reference_level,
+        central_multiplier_peak=max(point.value for point in points) / reference_level,
         already_past=already_past,
     )
 
@@ -627,7 +663,7 @@ def recommend_headroom(
     *,
     forecast: ForecastResult,
     saturation: SaturationResult,
-    reference_level: float,
+    reference_level: float | None = None,
     fleet: Fleet,
     lead_time: timedelta = timedelta(0),
     service_time: float | None = None,
@@ -638,11 +674,18 @@ def recommend_headroom(
 ) -> Recommendation:
     """Size a fleet against a forecast and a saturation ceiling.
 
-    ``reference_level`` is the demand level the saturation operating point was
-    measured at -- :func:`demand_reference` of the same series -- and it is
-    required rather than derived, because a recommendation built from a
-    forecast of one series and a ceiling measured on another is a unit error
-    that no amount of internal consistency will catch.
+    ``reference_level`` is the demand level the saturation operating point sits
+    at, and it defaults to :func:`demand_reference` of the analysis passed in.
+    Deriving it is the safe default: it is a bare number with no basis attached,
+    and supplying one measured a different way -- the window mean being the
+    obvious candidate -- silently scales every projected multiplier by the
+    peak-to-mean ratio. A value supplied explicitly is therefore checked against
+    the derived one and refused when the two disagree, so an override can
+    restate the basis but cannot change it.
+
+    The unit error a passed-in level used to invite -- a forecast of one series
+    against a ceiling measured on another -- is caught directly instead, by
+    requiring the two results to carry the same series key.
 
     ``service_time``, ``service_cv_squared`` and ``response_budget`` should be
     the values handed to :func:`models.saturation.analyse_saturation`. The
@@ -656,12 +699,37 @@ def recommend_headroom(
     that shows the recommendation without them is more confident than the
     evidence.
     """
-    if reference_level <= 0.0:
+    if forecast.key != saturation.key:
         raise RecommendationError(
-            f"demand reference must be positive, got {reference_level}"
+            "the forecast and the saturation analysis describe different series "
+            f"({forecast.key.label()} against {saturation.key.label()}), so no "
+            "multiplier relates one to the other"
         )
     if lead_time < timedelta(0):
         raise RecommendationError(f"lead time cannot be negative, got {lead_time}")
+
+    # Derived unless the caller restates it, and checked when they do. The
+    # tolerance is for the float arithmetic of recomputing the same product,
+    # not for a second opinion about the basis.
+    derived_reference: float | None = None
+    if saturation.profile is not None and saturation.limit is not None:
+        derived_reference = demand_reference(saturation)
+    if reference_level is None:
+        reference_level = derived_reference if derived_reference is not None else 0.0
+    elif reference_level <= 0.0:
+        raise RecommendationError(
+            f"demand reference must be positive, got {reference_level}"
+        )
+    elif derived_reference is not None and not math.isclose(
+        reference_level, derived_reference, rel_tol=1e-9
+    ):
+        raise RecommendationError(
+            f"the demand reference supplied ({reference_level:.6g}) is not the "
+            f"level of the saturation operating point ({derived_reference:.6g}); "
+            "the absorbable multiplier is a multiplier on that operating point, "
+            "so any other basis -- the window mean most of all -- scales every "
+            "projected multiplier by the ratio between the two"
+        )
 
     moment = now or datetime.now(tz=timezone.utc)
     series_label = saturation.key.label()
@@ -735,17 +803,33 @@ def recommend_headroom(
         )
 
     profile = saturation.profile
-    peak_to_mean = None if profile is None else profile.peak_to_mean
+    # The ceiling is a multiplier on the operating point, so the projection is
+    # divided by the level at that operating point and nothing else. What is
+    # left to disclose is that the crossing is read off the projected track at
+    # its peak rather than at the same percentile: the point that first reaches
+    # the ceiling may be the busiest hour of the horizon, while the operating
+    # point is the planning percentile of the observed window. The gap between
+    # a window's maximum and that percentile measures what the mismatch costs,
+    # and it costs conservatism -- the run-out date comes out no later than the
+    # arithmetic supports.
+    basis = f"a level of {reference_level:.6g}"
+    if profile is not None:
+        basis += f", the p{profile.planning_percentile * 100:.4g} of the observed window"
+    cost = ""
+    if profile is not None and profile.planning_value > 0.0:
+        ratio = profile.maximum / profile.planning_value
+        cost = f", which on the observed window is a factor of {ratio:.2f}"
     findings.append(
         Finding(
             "F702",
             "note",
-            "the ceiling is a multiplier on the operating point and the forecast "
-            "projects the series statistic, so comparing them holds the peak-to-mean "
-            f"ratio{'' if peak_to_mean is None else f' of {peak_to_mean:.2f}'} fixed "
-            "as the level moves: independent demand superposes and smooths, so for "
-            "aggregate growth this over-provisions slightly, but growth concentrated "
-            "in one large consumer gets no smoothing and the assumption is then neutral",
+            f"demand is expressed as a multiple of the operating point -- {basis} -- "
+            "because that is the basis the absorbable multiplier is stated on, and "
+            "not as a multiple of the window mean, which would scale every "
+            "projected multiplier by the peak-to-mean ratio. The crossing is then "
+            "taken at the projected track's own peak rather than at that percentile "
+            "of it, so the run-out date is early by the margin between a window's "
+            f"maximum and its operating percentile{cost}",
         )
     )
 
@@ -882,7 +966,16 @@ def recommend_headroom(
                 )
             )
 
-    target_multiplier = max(1.0, run_out.upper_multiplier_at_horizon)
+    # The peak over the horizon, not the value at its end. Sizing to the last
+    # projected period makes the recommended fleet a function of where the
+    # horizon happens to stop: on the example series a horizon ending in the
+    # weekly trough asks for no change while the same horizon extended by
+    # sixteen periods asks for nearly three times the fleet, on identical data
+    # and with an identical peak. It also contradicted the run-out date this
+    # same result reports, since the crossing is read off the peak -- so a
+    # review could say the ceiling is reached this afternoon and that no change
+    # is needed, in adjacent lines.
+    target_multiplier = max(1.0, run_out.upper_multiplier_peak)
     sizing = _build_sizing(
         fleet=fleet,
         utilization_now=utilization_now,
@@ -975,10 +1068,10 @@ def _build_sizing(
             Finding(
                 "F720",
                 "note",
-                f"the fleet absorbs {absorbable_now:.2f}x and the upper bound reaches "
-                f"{target_multiplier:.2f}x at the horizon, so no change is needed "
-                "within it: this is a statement about the horizon, and it expires "
-                "with the forecast that produced it",
+                f"the fleet absorbs {absorbable_now:.2f}x and the upper bound peaks "
+                f"at {target_multiplier:.2f}x within the horizon, so no change is "
+                "needed inside it: this is a statement about the horizon, and it "
+                "expires with the forecast that produced it",
             )
         )
 
@@ -1129,6 +1222,10 @@ def _render(recommendation: Recommendation) -> str:
     if run_out is not None:
         lines.append("")
         lines.append(f"  absorbable demand     {run_out.ceiling_multiplier:.2f}x")
+        lines.append(
+            f"  projected peak        {run_out.upper_multiplier_peak:.2f}x upper, "
+            f"{run_out.central_multiplier_peak:.2f}x central"
+        )
         lines.append(
             f"  projected at horizon  {run_out.upper_multiplier_at_horizon:.2f}x upper, "
             f"{run_out.central_multiplier_at_horizon:.2f}x central"
@@ -1392,7 +1489,6 @@ def run_from_args(
     recommendation = recommend_headroom(
         forecast=forecast,
         saturation=saturation,
-        reference_level=demand_reference(series),
         fleet=fleet,
         lead_time=lead_time,
         service_time=args.service_time,

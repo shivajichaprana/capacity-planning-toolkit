@@ -234,6 +234,24 @@ def _decision_section(review: Review) -> list[str]:
 
     run_out = recommendation.run_out
     if run_out is not None:
+        # The peak is what the fleet was sized against; the value at the
+        # horizon's last period is reported beside it because the two differ by
+        # a lot on a cyclical series and a reader comparing a review against a
+        # graph needs to know which one they are looking at.
+        rows.append(
+            (
+                "Projected demand (peak)",
+                f"{run_out.upper_multiplier_peak:.2f}x upper, "
+                f"{run_out.central_multiplier_peak:.2f}x central",
+            )
+        )
+        rows.append(
+            (
+                "Projected demand (horizon end)",
+                f"{run_out.upper_multiplier_at_horizon:.2f}x upper, "
+                f"{run_out.central_multiplier_at_horizon:.2f}x central",
+            )
+        )
         rows.append(("Run-out (upper bound)", _moment(run_out.upper_crossing)))
         rows.append(("Run-out (central)", _moment(run_out.central_crossing)))
         rows.append(("Forecast horizon ends", _moment(run_out.horizon_end)))
